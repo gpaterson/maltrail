@@ -324,10 +324,10 @@ pub fn load_trails(path: &Path, whitelist: &Whitelist, options: LoadOptions) -> 
     // Estimate from the average real-world record length; the tables grow if it is off.
     let estimated_rows = file_len / 48 + 16;
     let spill = options.file_backed.then(|| {
-        Spill::new(match path.parent() {
+        Spill::new(super::region::scratch_dir_override().unwrap_or_else(|| match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
             _ => std::path::PathBuf::from("."),
-        })
+        }))
     });
     // File-backed, the arena is sized to the one bound it can never exceed - every key is text of
     // this file - because a mapped page nobody writes costs nothing. On the heap that would be

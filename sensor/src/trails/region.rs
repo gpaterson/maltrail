@@ -37,6 +37,25 @@ pub struct Spill {
     dir: Arc<PathBuf>,
 }
 
+/// Fork-only: redirect the build's mmap-spill scratch files AND the on-disk trail-store cache
+/// (`cache.rs`) off whatever device `TRAILS_FILE` lives on, onto a separate one. Set by the
+/// systemd unit's own drop-in, not `maltrail.conf` - this is a per-host storage-layout decision,
+/// not something upstream's own config schema needs to carry.
+///
+/// Exists because `TRAILS_FILE` on a box like a Raspberry Pi 1B typically sits on the device's
+/// own boot SD card, which this build hits hard (region after region of scattered small writes
+/// as the hash tables grow and rehash). A box with a second, less failure-critical storage
+/// device (a USB-attached drive already used for `LOG_DIR`, say) can point this there instead,
+/// so a rebuild's I/O load lands on that device rather than the one everything else - including
+/// the OS itself - depends on.
+pub fn scratch_dir_override() -> Option<PathBuf> {
+    let v = std::env::var_os("MALTRAIL_TRAIL_SCRATCH_DIR")?;
+    if v.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(v))
+}
+
 impl Spill {
     pub fn new(dir: PathBuf) -> Spill {
         Spill { dir: Arc::new(dir) }

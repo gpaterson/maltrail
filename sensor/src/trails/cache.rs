@@ -128,7 +128,12 @@ impl Fingerprint {
 pub fn cache_path(trails_file: &Path) -> PathBuf {
     let mut name = trails_file.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".cache");
-    trails_file.with_file_name(name)
+    match super::region::scratch_dir_override() {
+        // Same device as the mmap-spill scratch files chose (`MALTRAIL_TRAIL_SCRATCH_DIR`) - see
+        // that function's doc for why a box might set this at all.
+        Some(dir) => dir.join(name),
+        None => trails_file.with_file_name(name),
+    }
 }
 
 /// One of the sections written after the header, in the fixed order both sides use.

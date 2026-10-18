@@ -333,7 +333,14 @@ pub fn run(cfg: &Config) -> i32 {
         }
     } else {
         let options = LoadOptions { repair_truncated_trails: cfg.repair_truncated_trails, ..Default::default() };
-        match crate::trails::load_with(&cfg.trails_file, &whitelist, options) {
+        // `load_cached`, not `load_with`: `ExecStartPre=-T` runs this on every single start, so a
+        // box where a full build is expensive (see `cache.rs`'s module doc) would otherwise pay
+        // that cost twice per start - once here, again for the `ExecStart` that follows - and
+        // NEVER get to benefit from a cache this step itself never writes. Using the same cache
+        // `ExecStart` does not weaken the check: a cache hit validates exactly the store
+        // `ExecStart` is about to run with, which is what "fail fast on a broken deployment" is
+        // for in the first place.
+        match crate::trails::load_cached(&cfg.root, &cfg.trails_file, cfg.user_whitelist.as_deref(), &whitelist, options) {
             Err(e) => r.line(Level::Fail, "trails", &format!("'{}' unreadable ({e})", cfg.trails_file.display())),
             Ok((db, stats)) => {
                 if stats.loaded == 0 {
