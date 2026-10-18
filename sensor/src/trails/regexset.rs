@@ -312,6 +312,43 @@ impl TrailRegex {
         &self.repaired
     }
 
+    /// Rebuild from a previous `build()`'s own output (`patterns()`/`source()`/`skipped()`/
+    /// `repaired()`/`uses_backtracking()`) - for the on-disk trail-store cache (`cache.rs`),
+    /// which persists exactly these fields rather than re-deciding, per trail, which ones belong
+    /// in the alternation. `fancy` is trusted directly (not re-derived via the "try fast, fall
+    /// back" dance `build()` does): it is simply the answer that dance already reached, and
+    /// recompiling `source` is the one part of a wildcard-set build this crate cannot skip - the
+    /// alternation is capped at 100 groups, so it is never the expensive part of a load
+    /// regardless of trail count.
+    pub fn from_parts(patterns: Vec<String>, source: String, skipped: Vec<String>, repaired: Vec<String>, fancy: bool) -> TrailRegex {
+        let regex = if source.is_empty() {
+            None
+        } else if fancy {
+            match pyre::build_fancy(&source) {
+                Ok(re) => Some(Engine::Backtracking(re)),
+                Err(e) => {
+                    crate::output::log_error(
+                        &format!("unable to compile the combined wildcard-trail regex ({e}); wildcard trail matching is disabled"),
+                        true,
+                    );
+                    None
+                }
+            }
+        } else {
+            match pyre::build(&source) {
+                Ok(re) => Some(Engine::Fast(re)),
+                Err(e) => {
+                    crate::output::log_error(
+                        &format!("unable to compile the combined wildcard-trail regex ({e}); wildcard trail matching is disabled"),
+                        true,
+                    );
+                    None
+                }
+            }
+        };
+        TrailRegex { regex, patterns, source, skipped, repaired, fancy }
+    }
+
     /// The trail keys that made it into the alternation, in group order — i.e. exactly the
     /// patterns `build_trails_regex()` would have concatenated. Used by the loader-parity test.
     pub fn patterns(&self) -> &[String] {
@@ -482,5 +519,66 @@ mod tests {
             b.offer(&format!("t{i}[0-9]+\\.com"), "(static)");
         }
         assert_eq!(b.build().len(), 100);
+    }
+
+    /// `from_parts` must answer exactly like the `TrailRegex` it was built from, for both
+    /// engines - this is what the on-disk trail-store cache rebuilds a regex from.
+    #[test]
+    fn from_parts_matches_exactly_like_the_original_build_fast_engine() {
+        let mut b = TrailRegexBuilder::default();
+        b.offer("evil.*\\.example", "(static)");
+        b.offer("bad[0-9]+\\.example", "(static)");
+        let original = b.build();
+        assert!(!original.uses_backtracking());
+
+        let rebuilt = TrailRegex::from_parts(
+            original.patterns().to_vec(),
+            original.source().to_string(),
+            original.skipped().to_vec(),
+            original.repaired().to_vec(),
+            original.uses_backtracking(),
+        );
+        for query in ["www.evilhost.example", "bad42.example", "fine.example"] {
+            assert_eq!(
+                original.find(query).map(|h| h.candidate),
+                rebuilt.find(query).map(|h| h.candidate),
+                "{query:?}"
+            );
+        }
+        assert_eq!(rebuilt.patterns(), original.patterns());
+        assert!(!rebuilt.uses_backtracking());
+    }
+
+    #[test]
+    fn from_parts_matches_exactly_like_the_original_build_backtracking_engine() {
+        let mut b = TrailRegexBuilder::default();
+        // CPython accepts look-around; the `regex` crate does not, forcing `fancy-regex`.
+        b.offer(r"evil(?=\.com)[a-z.]*", "(static)");
+        let original = b.build();
+        assert!(original.uses_backtracking());
+
+        let rebuilt = TrailRegex::from_parts(
+            original.patterns().to_vec(),
+            original.source().to_string(),
+            original.skipped().to_vec(),
+            original.repaired().to_vec(),
+            original.uses_backtracking(),
+        );
+        for query in ["www.evil.com", "evil.net"] {
+            assert_eq!(
+                original.find(query).map(|h| h.candidate),
+                rebuilt.find(query).map(|h| h.candidate),
+                "{query:?}"
+            );
+        }
+        assert!(rebuilt.uses_backtracking());
+    }
+
+    #[test]
+    fn from_parts_on_an_empty_regex_set_stays_empty() {
+        let rebuilt = TrailRegex::from_parts(Vec::new(), String::new(), Vec::new(), Vec::new(), false);
+        assert!(rebuilt.is_empty());
+        assert_eq!(rebuilt.len(), 0);
+        assert!(rebuilt.find("anything.example").is_none());
     }
 }

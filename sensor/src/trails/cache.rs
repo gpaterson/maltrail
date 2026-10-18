@@ -174,6 +174,14 @@ pub struct Layout {
     pub ip6_mask: usize,
     pub ip6_len: usize,
     pub total_len: usize,
+    /// `LoadStats` from the build that produced this cache, so a cache HIT reports the same
+    /// "[i] N trails loaded" diagnostics a fresh build would have - these are not derivable from
+    /// the tables alone (`loaded` counts rows, including ones a later duplicate overwrote;
+    /// `total_len` is the distinct-key count `TrailDb::len()` reports).
+    pub stats_rows: usize,
+    pub stats_loaded: usize,
+    pub stats_whitelisted: usize,
+    pub stats_malformed: usize,
     offsets: [(usize, usize); SECTIONS.len()],
 }
 
@@ -310,6 +318,10 @@ pub struct WriteParts<'a> {
     pub regex_repaired: &'a [String],
     pub regex_fancy: bool,
     pub total_len: usize,
+    pub stats_rows: usize,
+    pub stats_loaded: usize,
+    pub stats_whitelisted: usize,
+    pub stats_malformed: usize,
 }
 
 fn u64_bytes(words: &[u64]) -> &[u8] {
@@ -357,6 +369,10 @@ pub fn write(path: &Path, fingerprint: &Fingerprint, parts: &WriteParts) -> std:
         parts.ip6_mask as u64,
         parts.ip6_len as u64,
         parts.total_len as u64,
+        parts.stats_rows as u64,
+        parts.stats_loaded as u64,
+        parts.stats_whitelisted as u64,
+        parts.stats_malformed as u64,
     ] {
         header.extend_from_slice(&v.to_le_bytes());
     }
@@ -456,7 +472,7 @@ const HEADER_UNPADDED_LEN: usize = 8 // magic
     + (8 + 8 + 4) // whitelist FileStamp
     + 1 + (8 + 8 + 4) // has_user_wl + user_whitelist FileStamp
     + 1 // repair_truncated_trails
-    + 8 * 9; // the nine u64 scalars
+    + 8 * 13; // the thirteen u64 scalars
 
 const HEADER_FIXED_LEN: usize = HEADER_UNPADDED_LEN.next_multiple_of(8);
 
@@ -487,6 +503,10 @@ pub fn open(path: &Path, want: &Fingerprint) -> Option<Opened> {
     let ip6_mask = r.usize();
     let ip6_len = r.usize();
     let total_len = r.usize();
+    let stats_rows = r.usize();
+    let stats_loaded = r.usize();
+    let stats_whitelisted = r.usize();
+    let stats_malformed = r.usize();
 
     // `r.pos` is `HEADER_UNPADDED_LEN` here; the writer rounded up to `HEADER_FIXED_LEN` before
     // the section table, so the reader must skip the same padding to land on it.
@@ -501,7 +521,22 @@ pub fn open(path: &Path, want: &Fingerprint) -> Option<Opened> {
         }
         *slot = (offset, len);
     }
-    let layout = Layout { str_mask, str_len, ip4_mask, ip4_len, ip4_port_mask, ip4_port_len, ip6_mask, ip6_len, total_len, offsets };
+    let layout = Layout {
+        str_mask,
+        str_len,
+        ip4_mask,
+        ip4_len,
+        ip4_port_mask,
+        ip4_port_len,
+        ip6_mask,
+        ip6_len,
+        total_len,
+        stats_rows,
+        stats_loaded,
+        stats_whitelisted,
+        stats_malformed,
+        offsets,
+    };
 
     let (o, l) = layout.section(Section::Ip6Port);
     let mut pr = Cursor::new(&bytes[o..o + l]);
@@ -623,6 +658,10 @@ mod tests {
             regex_repaired: &[],
             regex_fancy: false,
             total_len: 0,
+            stats_rows: 0,
+            stats_loaded: 0,
+            stats_whitelisted: 0,
+            stats_malformed: 0,
         }
     }
 
