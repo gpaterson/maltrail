@@ -71,6 +71,24 @@ impl NegativeFilter {
         NegativeFilter { bits: Region::filled(want_bits / 64, 0u64, spill), mask: want_bits - 1 }
     }
 
+    /// The bitmap, as the raw words `cache.rs` writes out — `mask` is `bits.len() * 64 - 1`
+    /// always, so nothing else needs to be stored for this table.
+    pub(crate) fn raw_bits(&self) -> &[u64] {
+        &self.bits
+    }
+
+    /// Rebuild from a slice of someone else's mapping — see `Region::from_cache_slice`.
+    ///
+    /// # Safety
+    /// `offset` must be where `cache.rs` wrote this filter's `bits_words` words of a
+    /// `NegativeFilter` it got from `raw_bits()`. There is no way to tell a filter over N entries
+    /// from a filter over a different N once it is just bytes - the cache fingerprint is what
+    /// stands behind this, not anything checked here.
+    pub(crate) unsafe fn from_cache(file: &std::sync::Arc<super::region::CacheFile>, offset: usize, bits_words: usize) -> NegativeFilter {
+        let bits = Region::from_cache_slice(file, offset, bits_words);
+        NegativeFilter { bits, mask: bits_words * 64 - 1 }
+    }
+
     #[inline]
     fn positions(&self, h: u64) -> (usize, usize) {
         // Two independent positions from one hash: the low half and the high half, both already
@@ -124,6 +142,7 @@ fn capacity_for(n: usize) -> usize {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct StrSlot {
     tag: u32,
     off: u32,
@@ -166,6 +185,50 @@ impl StrTable {
     /// Whether the slots live in a file-backed mapping rather than on the heap.
     pub fn is_mapped(&self) -> bool {
         self.slots.is_mapped()
+    }
+
+    /// The raw pieces `cache.rs` writes out, in the order it writes them: arena bytes, slot
+    /// bytes, filter-bitmap words. `mask` and `len` are small enough to go straight in the
+    /// cache header rather than earning a section of their own.
+    pub(crate) fn raw_parts(&self) -> (&[u8], &[u8], &[u64]) {
+        let slot_bytes = unsafe {
+            std::slice::from_raw_parts(self.slots.as_ptr() as *const u8, self.slots.len() * std::mem::size_of::<StrSlot>())
+        };
+        (&*self.arena, slot_bytes, self.filter.raw_bits())
+    }
+
+    pub(crate) fn mask(&self) -> usize {
+        self.mask
+    }
+
+    /// Rebuild from three slices of someone else's mapping, at the offsets `cache.rs` wrote
+    /// them. `cache.rs` already checked the fingerprint before calling this — nothing here
+    /// re-derives `mask`/`len`/`filter` size from the data itself, because by the time this is
+    /// wrong the file has already passed as "this build's own cache".
+    ///
+    /// # Safety
+    /// Same contract as `Region::from_cache_slice`, once per slice: each `(offset, count)` must
+    /// be exactly where `cache.rs` put the bytes this returns reads back as.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn from_cache(
+        file: &std::sync::Arc<super::region::CacheFile>,
+        arena_offset: usize,
+        arena_len: usize,
+        slots_offset: usize,
+        slots_len: usize,
+        filter_offset: usize,
+        filter_words: usize,
+        mask: usize,
+        len: usize,
+    ) -> StrTable {
+        StrTable {
+            arena: super::region::Arena::from_cache(file, arena_offset, arena_len),
+            slots: Region::from_cache_slice(file, slots_offset, slots_len),
+            mask,
+            len,
+            filter: NegativeFilter::from_cache(file, filter_offset, filter_words),
+            spill: None,
+        }
     }
 
     /// Start writing the built table back, so its pages become reclaimable (see `region.rs`).
@@ -307,6 +370,7 @@ impl StrTable {
 }
 
 #[derive(Clone, Copy)]
+#[repr(C)]
 struct IntSlot<K> {
     key: K,
     val: u32,
@@ -379,6 +443,41 @@ impl<K: IntKey> IntTable<K> {
     pub fn flush_async(&self) {
         self.slots.flush_async();
         self.filter.bits.flush_async();
+    }
+
+    /// See `StrTable::raw_parts` - same idea, one fewer piece (there is no arena: the key is
+    /// the slot).
+    pub(crate) fn raw_parts(&self) -> (&[u8], &[u64]) {
+        let slot_bytes = unsafe {
+            std::slice::from_raw_parts(self.slots.as_ptr() as *const u8, self.slots.len() * std::mem::size_of::<IntSlot<K>>())
+        };
+        (slot_bytes, self.filter.raw_bits())
+    }
+
+    pub(crate) fn mask(&self) -> usize {
+        self.mask
+    }
+
+    /// See `StrTable::from_cache` - same contract.
+    ///
+    /// # Safety
+    /// Same as `StrTable::from_cache`.
+    pub(crate) unsafe fn from_cache(
+        file: &std::sync::Arc<super::region::CacheFile>,
+        slots_offset: usize,
+        slots_len: usize,
+        filter_offset: usize,
+        filter_words: usize,
+        mask: usize,
+        len: usize,
+    ) -> IntTable<K> {
+        IntTable {
+            slots: Region::from_cache_slice(file, slots_offset, slots_len),
+            mask,
+            len,
+            filter: NegativeFilter::from_cache(file, filter_offset, filter_words),
+            spill: None,
+        }
     }
 
     pub fn len(&self) -> usize {

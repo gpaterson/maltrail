@@ -12,6 +12,7 @@
 //! The store is immutable once built. Reloads publish a fresh `Arc` through `TrailStore`,
 //! which workers pick up with a single relaxed atomic load — no lock on the packet path.
 
+pub mod cache;
 pub mod loader;
 pub mod regexset;
 pub mod region;

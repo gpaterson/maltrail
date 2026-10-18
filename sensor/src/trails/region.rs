@@ -87,6 +87,65 @@ impl Spill {
     }
 }
 
+/// A whole file, mapped read-only once and shared by every [`Region`] that borrows a slice of
+/// it (see `cache.rs`). One `mmap`, however many tables it backs, rather than one per table -
+/// which also means there is exactly one thing to `munmap`, when the last region referencing it
+/// (via its `Arc`) is gone.
+///
+/// `MAP_PRIVATE`, not `MAP_SHARED`: nothing in this crate ever writes through a cache mapping
+/// (`TrailDb` is immutable once `finish()` returns, and the cache is only ever opened for
+/// reading), but if a bug ever did, `MAP_PRIVATE` makes that a copy-on-write into process memory
+/// instead of silent corruption of the cache file on disk, which every other load after this one
+/// would then also read back.
+pub struct CacheFile {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for CacheFile {}
+unsafe impl Sync for CacheFile {}
+
+impl CacheFile {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn open(path: &std::path::Path) -> std::io::Result<CacheFile> {
+        use std::io::ErrorKind;
+        use std::os::unix::io::AsRawFd;
+
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        if len == 0 {
+            return Err(std::io::Error::new(ErrorKind::InvalidData, "empty cache file"));
+        }
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(CacheFile { ptr: ptr as *mut u8, len })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn open(_path: &std::path::Path) -> std::io::Result<CacheFile> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "trail-store cache needs mmap (Linux only)"))
+    }
+
+    /// The raw bytes, for the header/fingerprint check before anything is reinterpreted as a
+    /// table.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: `ptr`/`len` map a whole, already-opened file for the lifetime of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl Drop for CacheFile {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len) };
+    }
+}
+
 enum Backing<T> {
     /// Held only to own (and eventually free) the memory `ptr` points into.
     #[allow(dead_code)]
@@ -94,6 +153,11 @@ enum Backing<T> {
     // read only by the Linux unmap/msync paths; elsewhere nothing is ever mapped
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Mapped { bytes: usize },
+    /// A slice of a [`CacheFile`] someone else mapped and owns. Dropping this does nothing;
+    /// the mapping itself goes away only when the last `Arc<CacheFile>` pointing at it does
+    /// (see `cache.rs`). `T` never appears in the variant - the slice is plain bytes, reinterpreted
+    /// by `from_cache_slice` - so one mapping can back regions of different `T`.
+    Borrowed(#[allow(dead_code)] Arc<CacheFile>),
 }
 
 /// A fixed-length array of `T`, on the heap or file-backed (see the module doc).
@@ -134,6 +198,25 @@ impl<T: Pod> Region<T> {
 
     pub fn is_mapped(&self) -> bool {
         matches!(self.backing, Backing::Mapped { .. })
+    }
+
+    /// A view into someone else's whole-file mapping (see [`CacheFile`]), at a byte offset the
+    /// caller computed when it wrote that file. `len` elements of `T` must fit inside `file`
+    /// starting at `offset`, and `offset` must already be aligned for `T` — `cache.rs` lays the
+    /// file out so every region starts on a page boundary, which satisfies every `T` this module
+    /// has.
+    ///
+    /// # Safety
+    /// `offset + len * size_of::<T>() <= file.len()`, `offset` is aligned for `T`, and the bytes
+    /// there really are `len` valid `T`s - which only holds for bytes this crate wrote itself in
+    /// this layout. Reading someone else's file, or a shorter/older one, is instant undefined
+    /// behaviour: there is no validation here, by design, because the caller just checked a
+    /// fingerprint over the whole file and a torn write would have changed it.
+    pub unsafe fn from_cache_slice(file: &Arc<CacheFile>, offset: usize, len: usize) -> Region<T> {
+        debug_assert_eq!(offset % std::mem::align_of::<T>(), 0, "cache region misaligned for T");
+        debug_assert!(offset + len * std::mem::size_of::<T>() <= file.len, "cache region out of bounds");
+        let ptr = file.ptr.add(offset) as *mut T;
+        Region { ptr, len, backing: Backing::Borrowed(file.clone()), _marker: PhantomData }
     }
 
     /// Start writing the dirty pages back now, so they are reclaimable by the time the kernel wants
@@ -178,6 +261,10 @@ impl<T: Pod> Drop for Region<T> {
 pub enum Arena {
     Heap(Vec<u8>),
     Mapped { region: Region<u8>, used: usize, spill: Spill },
+    /// A cache-loaded arena (see `cache.rs`). Exactly `region.len()` bytes, all of them real
+    /// content - unlike `Mapped`, there is no `used` short of the region's own length, because
+    /// `cache.rs` writes the arena at its final size and this never grows afterwards.
+    Borrowed(Region<u8>),
 }
 
 impl Arena {
@@ -191,11 +278,17 @@ impl Arena {
         Arena::Heap(Vec::with_capacity(capacity))
     }
 
+    /// See `Region::from_cache_slice` for the safety contract this inherits unchanged.
+    pub(crate) unsafe fn from_cache(file: &std::sync::Arc<CacheFile>, offset: usize, len: usize) -> Arena {
+        Arena::Borrowed(Region::from_cache_slice(file, offset, len))
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         match self {
             Arena::Heap(v) => v.len(),
             Arena::Mapped { used, .. } => *used,
+            Arena::Borrowed(region) => region.len(),
         }
     }
 
@@ -215,6 +308,7 @@ impl Arena {
                 region[*used..*used + data.len()].copy_from_slice(data);
                 *used += data.len();
             }
+            Arena::Borrowed(_) => unreachable!("a cache-loaded TrailDb is immutable; nothing appends to its arena"),
         }
     }
 
@@ -225,7 +319,7 @@ impl Arena {
     }
 
     pub fn is_mapped(&self) -> bool {
-        matches!(self, Arena::Mapped { .. })
+        matches!(self, Arena::Mapped { .. } | Arena::Borrowed(_))
     }
 }
 
@@ -236,6 +330,7 @@ impl std::ops::Deref for Arena {
         match self {
             Arena::Heap(v) => v,
             Arena::Mapped { region, used, .. } => &region[..*used],
+            Arena::Borrowed(region) => region,
         }
     }
 }
@@ -250,6 +345,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_cache_file_region_reads_back_what_was_written_at_its_offset() {
+        let dir = scratch("cachefile");
+        let path = dir.join("cache.bin");
+        // Two regions packed into one file: 4 u64s at offset 0, then 3 u8s right after, at an
+        // offset chosen to still be 8-byte aligned (what `cache.rs` actually guarantees for every
+        // region it writes).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[11u64, 22, 33, 44].iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
+        bytes.extend_from_slice(&[5u8, 6, 7]);
+        bytes.resize(bytes.len() + (8 - bytes.len() % 8) % 8, 0); // pad to a multiple of 8
+        std::fs::write(&path, &bytes).unwrap();
+
+        let file = Arc::new(CacheFile::open(&path).unwrap());
+        assert_eq!(file.len(), bytes.len());
+        let ints: Region<u64> = unsafe { Region::from_cache_slice(&file, 0, 4) };
+        assert_eq!(&*ints, &[11, 22, 33, 44]);
+        let bytes_region: Region<u8> = unsafe { Region::from_cache_slice(&file, 32, 3) };
+        assert_eq!(&*bytes_region, &[5, 6, 7]);
+        // Both regions keep the SAME file mapped alive (one Arc, two clones) - dropping one must
+        // not unmap it out from under the other.
+        drop(ints);
+        assert_eq!(&*bytes_region, &[5, 6, 7]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
