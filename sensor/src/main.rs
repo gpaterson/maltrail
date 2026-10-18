@@ -282,7 +282,7 @@ fn run() -> i32 {
     // every IOC added since that file was written.
     refresh_trails(&cfg, args.quiet, true);
 
-    let (db, stats) = match trails::load_with(&cfg.trails_file, &whitelist, load_options(&cfg)) {
+    let (db, stats) = match trails::load_cached(&cfg.root, &cfg.trails_file, cfg.user_whitelist.as_deref(), &whitelist, load_options(&cfg)) {
         Ok(v) => v,
         Err(e) => {
             ceprintln!("[!] something went wrong during trails file read '{}' ('{e}')", cfg.trails_file.display());
@@ -544,7 +544,7 @@ fn run() -> i32 {
                         continue;
                     }
                     last_mtime = mtime;
-                    match trails::load_with(&cfg_reload.trails_file, &wl_reload, load_options(&cfg_reload)) {
+                    match trails::load_cached(&cfg_reload.root, &cfg_reload.trails_file, cfg_reload.user_whitelist.as_deref(), &wl_reload, load_options(&cfg_reload)) {
                         Ok((db, stats)) => {
                             // A reload that loses most of the trail set is far more likely to be a
                             // half-written or truncated file than a real change, and publishing it

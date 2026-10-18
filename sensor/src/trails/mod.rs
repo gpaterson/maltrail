@@ -137,6 +137,124 @@ impl TrailDb {
     pub fn ip6_count(&self) -> usize {
         self.ip6.len() + self.ip6_port.len()
     }
+
+    /// Write this store to the on-disk cache (`cache.rs`) at `path`, so the next load with a
+    /// matching `fingerprint` can mmap it back instead of rebuilding from `TRAILS_FILE`.
+    ///
+    /// Fork-only (see `cache.rs`'s module doc). Errors are the caller's to decide on - a cache
+    /// write that fails (full disk, read-only filesystem) must never fail the load it followed;
+    /// the sensor already has a perfectly good, freshly-built store in memory regardless of
+    /// whether writing it back out succeeded.
+    pub fn write_cache(&self, path: &Path, fingerprint: &cache::Fingerprint, stats: &loader::LoadStats) -> std::io::Result<()> {
+        let (arena, str_slots, str_filter) = self.strings.raw_parts();
+        let (ip4_slots, ip4_filter) = self.ip4.raw_parts();
+        let (ip4_port_slots, ip4_port_filter) = self.ip4_port.raw_parts();
+        let (ip6_slots, ip6_filter) = self.ip6.raw_parts();
+        let ip6_port: Vec<((u128, u16), u32)> = self.ip6_port.iter().map(|(&k, &v)| (k, v)).collect();
+        let pairs: Vec<(Box<str>, Box<str>)> = self.pairs.clone();
+
+        let parts = cache::WriteParts {
+            arena,
+            str_slots,
+            str_filter,
+            str_mask: self.strings.mask(),
+            str_len: self.strings.len(),
+            ip4_slots,
+            ip4_filter,
+            ip4_mask: self.ip4.mask(),
+            ip4_len: self.ip4.len(),
+            ip4_port_slots,
+            ip4_port_filter,
+            ip4_port_mask: self.ip4_port.mask(),
+            ip4_port_len: self.ip4_port.len(),
+            ip6_slots,
+            ip6_filter,
+            ip6_mask: self.ip6.mask(),
+            ip6_len: self.ip6.len(),
+            ip6_port: &ip6_port,
+            pairs: &pairs,
+            regex_patterns: self.regex.patterns(),
+            regex_source: self.regex.source(),
+            regex_skipped: self.regex.skipped(),
+            regex_repaired: self.regex.repaired(),
+            regex_fancy: self.regex.uses_backtracking(),
+            total_len: self.len,
+            stats_rows: stats.rows,
+            stats_loaded: stats.loaded,
+            stats_whitelisted: stats.whitelisted,
+            stats_malformed: stats.malformed,
+        };
+        cache::write(path, fingerprint, &parts)
+    }
+
+    /// Rebuild straight from a cache mapping `cache::open()` already validated against the
+    /// current fingerprint. Every big table is a zero-copy view into `opened.file` (kept alive
+    /// by the `Arc` each `Region` holds); only the three small blobs — `pairs`, `ip6_port`, the
+    /// regex's own fields — were ever copied off disk, by `cache::open()` itself.
+    ///
+    /// # Safety
+    /// `opened` must be the `Opened` that THIS validated fingerprint produced — which is exactly
+    /// what `cache::open()` already guarantees by construction; this does not re-check anything,
+    /// it only reinterprets the bytes `open()` already stood behind.
+    pub(crate) unsafe fn from_cache(opened: cache::Opened) -> TrailDb {
+        let file = &opened.file;
+        let (o, l) = opened.arena();
+        let strings_arena_len = l;
+        let (so, sl) = opened.str_slots();
+        let (fo, fw) = opened.str_filter();
+        let strings = StrTable::from_cache(
+            file,
+            o,
+            strings_arena_len,
+            so,
+            sl / StrTable::slot_byte_size(),
+            fo,
+            fw / 8,
+            opened.layout.str_mask,
+            opened.layout.str_len,
+        );
+
+        let (so, sl) = opened.ip4_slots();
+        let (fo, fw) = opened.ip4_filter();
+        let ip4 = IntTable::<u32>::from_cache(
+            file,
+            so,
+            sl / IntTable::<u32>::slot_byte_size(),
+            fo,
+            fw / 8,
+            opened.layout.ip4_mask,
+            opened.layout.ip4_len,
+        );
+
+        let (so, sl) = opened.ip4_port_slots();
+        let (fo, fw) = opened.ip4_port_filter();
+        let ip4_port = IntTable::<u64>::from_cache(
+            file,
+            so,
+            sl / IntTable::<u64>::slot_byte_size(),
+            fo,
+            fw / 8,
+            opened.layout.ip4_port_mask,
+            opened.layout.ip4_port_len,
+        );
+
+        let (so, sl) = opened.ip6_slots();
+        let (fo, fw) = opened.ip6_filter();
+        let ip6 = IntTable::<u128>::from_cache(
+            file,
+            so,
+            sl / IntTable::<u128>::slot_byte_size(),
+            fo,
+            fw / 8,
+            opened.layout.ip6_mask,
+            opened.layout.ip6_len,
+        );
+
+        let ip6_port: crate::fasthash::FastMap<(u128, u16), u32> = opened.ip6_port.iter().copied().collect();
+        let regex = TrailRegex::from_parts(opened.regex_patterns, opened.regex_source, opened.regex_skipped, opened.regex_repaired, opened.regex_fancy);
+
+        TrailDb { pairs: opened.pairs, strings, ip4, ip4_port, ip6, ip6_port, regex, len: opened.layout.total_len }
+    }
 }
 
 pub struct TrailDbBuilder {
@@ -347,6 +465,53 @@ pub fn load_with(
     loader::load_trails(path, whitelist, options)
 }
 
+/// `load_with()`, but first checking the on-disk cache (`cache.rs`) and writing one after a
+/// fresh build. Fork-only — see `cache.rs`'s module doc for why this exists and what it
+/// deliberately does not change about `load_with()`'s own behaviour or guarantees: a cache miss
+/// (first run, a changed input, a write that failed last time) falls all the way through to the
+/// exact same build `load_with()` would have done, byte for byte.
+///
+/// `root` is `Config.root` (for `data/whitelist.txt`'s path) and `user_whitelist` is
+/// `Config.user_whitelist` - both are inputs to the fingerprint, not to the load itself, which
+/// is why they are not already part of `whitelist` or `options`.
+pub fn load_cached(
+    root: &Path,
+    trails_file: &Path,
+    user_whitelist: Option<&Path>,
+    whitelist: &crate::whitelist::Whitelist,
+    options: loader::LoadOptions,
+) -> std::io::Result<(TrailDb, loader::LoadStats)> {
+    let fingerprint = cache::Fingerprint::compute(root, trails_file, user_whitelist, options.repair_truncated_trails);
+    let cache_file_path = cache::cache_path(trails_file);
+
+    if let Some(fp) = &fingerprint {
+        if let Some(opened) = cache::open(&cache_file_path, fp) {
+            let stats = loader::LoadStats {
+                rows: opened.layout.stats_rows,
+                loaded: opened.layout.stats_loaded,
+                whitelisted: opened.layout.stats_whitelisted,
+                malformed: opened.layout.stats_malformed,
+            };
+            // SAFETY: `opened` is exactly what `cache::open()` validated against `fp` above -
+            // the contract `TrailDb::from_cache` asks for.
+            let db = unsafe { TrailDb::from_cache(opened) };
+            return Ok((db, stats));
+        }
+    }
+
+    let (db, stats) = loader::load_trails(trails_file, whitelist, options)?;
+    if let Some(fp) = &fingerprint {
+        // A failed cache write must never fail the load that produced it - the store in `db` is
+        // already complete and correct regardless of whether it could also be saved for next
+        // time. Logged, not surfaced: this runs on every startup and reload, and a full disk or
+        // read-only filesystem is not news worth repeating on every one of them.
+        if let Err(e) = db.write_cache(&cache_file_path, fp, &stats) {
+            crate::output::log_error(&format!("could not write the trail-store cache ({e}); continuing without it"), true);
+        }
+    }
+    Ok((db, stats))
+}
+
 pub use loader::{split_csv_record, LoadOptions};
 pub use regexset::is_wildcard_trail;
 
@@ -433,5 +598,74 @@ mod tests {
         assert!(view.refresh());
         assert!(view.db().contains("b.com"));
         assert!(!view.db().contains("a.com"));
+    }
+
+    /// End to end: `load_cached()` on a trail set with every kind of native key, a wildcard, and
+    /// a duplicate - first with no cache (must build and write one), then again (must come back
+    /// from it with identical answers), then after an edit to `TRAILS_FILE` (must notice and
+    /// rebuild, not serve the stale one).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn load_cached_round_trips_through_a_real_cache_file_and_notices_edits() {
+        let dir = std::env::temp_dir().join(format!("mt-load-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data").join("whitelist.txt"), "").unwrap();
+
+        let trails_file = dir.join("trails.csv");
+        std::fs::write(
+            &trails_file,
+            "evil.example,malware (test),(static)\n\
+             1.2.3.4,badnet,(static)\n\
+             1.2.3.4:8443,c2,(static)\n\
+             dead::beef,badnet6,(static)\n\
+             [dead::beef]:53,c26,(static)\n\
+             evil.*\\.wild,wildcard,(static)\n\
+             dup.example,first,(static)\n\
+             dup.example,last wins,(static)\n",
+        )
+        .unwrap();
+
+        let whitelist = crate::whitelist::Whitelist::load(&dir, None);
+        let options = loader::LoadOptions::default();
+        let cache_path = cache::cache_path(&trails_file);
+        assert!(!cache_path.is_file(), "nothing written yet");
+
+        // First call: no cache exists, so this builds fresh and must write one on its way out.
+        let (fresh, fresh_stats) = load_cached(&dir, &trails_file, None, &whitelist, options).unwrap();
+        assert!(cache_path.is_file(), "a fresh build must write the cache behind it");
+        assert_eq!(fresh.get("dup.example").map(|v| v.info), Some("last wins"));
+        assert_eq!(fresh_stats.loaded, 8);
+
+        use crate::addr::{addr_to_int, parse_ipv6, Ip};
+        let v4 = Ip::V4(addr_to_int("1.2.3.4").unwrap());
+        let v6 = Ip::V6(parse_ipv6("dead::beef").unwrap());
+
+        // Second call: same inputs, so this must be a cache HIT - check it by fingerprinting
+        // behaviour (everything answers identically), not by instrumenting which path ran,
+        // because "answers the same" is the actual guarantee this module exists to keep.
+        let (cached, cached_stats) = load_cached(&dir, &trails_file, None, &whitelist, options).unwrap();
+        assert_eq!(cached.len(), fresh.len());
+        assert_eq!(cached.get("evil.example").map(|v| v.info), Some("malware (test)"));
+        assert_eq!(cached.get("dup.example").map(|v| v.info), Some("last wins"));
+        assert_eq!(cached.get_ip(v4).map(|v| v.info), Some("badnet"));
+        assert_eq!(cached.get_ip_port(v4, 8443).map(|v| v.info), Some("c2"));
+        assert_eq!(cached.get_ip(v6).map(|v| v.info), Some("badnet6"));
+        assert_eq!(cached.get_ip_port(v6, 53).map(|v| v.info), Some("c26"));
+        assert_eq!(cached.regex().patterns(), fresh.regex().patterns());
+        assert!(cached.contains_domain_member("www.evil.example"));
+        assert_eq!(cached_stats.loaded, fresh_stats.loaded);
+        assert_eq!(cached_stats.rows, fresh_stats.rows);
+
+        // Edit TRAILS_FILE (new mtime, different content) - the fingerprint must change, so this
+        // must rebuild rather than keep serving the now-stale cache.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&trails_file, "new-trail.example,new,(static)\n").unwrap();
+        let (rebuilt, rebuilt_stats) = load_cached(&dir, &trails_file, None, &whitelist, options).unwrap();
+        assert_eq!(rebuilt_stats.loaded, 1);
+        assert!(rebuilt.contains("new-trail.example"));
+        assert!(!rebuilt.contains("evil.example"), "the edited file no longer has the old trails");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -201,6 +201,13 @@ impl StrTable {
         self.mask
     }
 
+    /// Bytes per slot - `StrSlot` is private to this module, so this is how `mod.rs` turns a
+    /// byte length (what `cache.rs`'s `Opened` hands back) into the element count
+    /// `from_cache`/`Region::from_cache_slice` need.
+    pub(crate) fn slot_byte_size() -> usize {
+        std::mem::size_of::<StrSlot>()
+    }
+
     /// Rebuild from three slices of someone else's mapping, at the offsets `cache.rs` wrote
     /// them. `cache.rs` already checked the fingerprint before calling this — nothing here
     /// re-derives `mask`/`len`/`filter` size from the data itself, because by the time this is
@@ -456,6 +463,11 @@ impl<K: IntKey> IntTable<K> {
 
     pub(crate) fn mask(&self) -> usize {
         self.mask
+    }
+
+    /// See `StrTable::slot_byte_size` - same idea, for `IntSlot<K>`.
+    pub(crate) fn slot_byte_size() -> usize {
+        std::mem::size_of::<IntSlot<K>>()
     }
 
     /// See `StrTable::from_cache` - same contract.
