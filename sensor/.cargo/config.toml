@@ -1,0 +1,21 @@
+# Cross-compiling for 32-bit ARM musl (e.g. arm-unknown-linux-musleabihf, used by older
+# Raspberry Pi boards) against a musl >=1.2 ("time64") toolchain needs two extra link
+# settings that a native build gets for free:
+#
+# - `--cfg musl32_time64`: the `libc` crate's build script can only detect whether the
+#   target musl uses the new 64-bit `time_t` by probing an env var nothing sets during a
+#   cross build, so it silently falls back to the legacy 32-bit layout. If the actual
+#   cross toolchain's musl is >=1.2, that guess is wrong and misaligns every field read of
+#   libpcap's `pcap_pkthdr` (ts/caplen/len) through this crate's pcap bindings - caplen
+#   reads back as 0 for every packet, so every captured or replayed packet is silently
+#   dropped (`ignored` in the sensor's own metrics line) with no error or panic.
+# - `-lgcc`: 32-bit ARMv6 has no native atomic instructions; `__sync_synchronize` (needed
+#   by libpcap's ring-buffer code) is a libgcc intrinsic, not a libatomic one, and `-lgcc`
+#   is not pulled in automatically once `-nodefaultlibs` is in play.
+#
+# Caveat: cargo does not merge this with a `RUSTFLAGS` environment variable - if one is set
+# (e.g. to add a `-L` path to a custom-built static libpcap, which cross-compiling for this
+# target usually needs), it replaces this file's `rustflags` entirely rather than combining
+# with it, and the two flags below must be added to that `RUSTFLAGS` value by hand instead.
+[target.arm-unknown-linux-musleabihf]
+rustflags = ["--cfg", "musl32_time64", "-C", "link-arg=-lgcc"]
