@@ -43,6 +43,8 @@ struct Buckets {
     writers: Vec<BufWriter<File>>,
     shift: u32,
     mask: usize,
+    /// Bytes written since the last `sync_data()`, for `PACE_SYNC_BYTES` pacing - see its doc.
+    since_sync: usize,
 }
 
 /// Target bucket size. Small enough to comfortably fit in RAM that is actually free on the
@@ -51,29 +53,53 @@ struct Buckets {
 /// error next to a 1.9 M-row build.
 const BUCKET_TARGET_BYTES: usize = 10 << 20;
 
+/// How many bytes `Buckets::write` lets accumulate before forcing a synchronous `sync_data()`.
+///
+/// Partitioning alone bounds WHERE a build's writes land; it does nothing about the RATE they
+/// happen at. Without this, the partition phase dirties pages as fast as the CPU can produce
+/// them - far faster than a throttled or genuinely slow device can write them back - and a
+/// cgroup `memory.max` can OOM-kill that backlog outright: reclaimable (file-backed) memory is
+/// only an escape from an anonymous-memory hard ceiling if reclaim can keep up with allocation,
+/// and a large enough rate mismatch defeats that regardless of whether the memory is
+/// reclaimable in principle. Periodically calling `sync_data()` turns "write arbitrarily far
+/// ahead of the device" into "write, then wait for the device," which is the same throttling a
+/// synchronous write would have imposed naturally - except it is applied in page-sized chunks
+/// small enough that each one still fits comfortably in whatever is actually free, not in one
+/// burst sized to the whole 1.9 M-row file.
+const PACE_SYNC_BYTES: usize = 1 << 20;
+
 /// Per-entry encoding: `hash:u64, pair:u32, native tag:u8 [+ payload], trail len:u32, trail
 /// bytes`. Fixed-then-variable, in that order, so a reader never has to buffer more than one
 /// entry to replay it.
-fn encode_native(out: &mut impl Write, native: NativeKey) -> std::io::Result<()> {
+/// Returns how many bytes were written, for `Buckets::write`'s sync-pacing counter - cheaper
+/// than asking the file for it, and exact rather than a worst-case guess.
+fn encode_native(out: &mut impl Write, native: NativeKey) -> std::io::Result<usize> {
     match native {
-        NativeKey::None => out.write_all(&[0]),
+        NativeKey::None => {
+            out.write_all(&[0])?;
+            Ok(1)
+        }
         NativeKey::Ip(Ip::V4(v)) => {
             out.write_all(&[1])?;
-            out.write_all(&v.to_le_bytes())
+            out.write_all(&v.to_le_bytes())?;
+            Ok(5)
         }
         NativeKey::Ip(Ip::V6(v)) => {
             out.write_all(&[2])?;
-            out.write_all(&v.to_le_bytes())
+            out.write_all(&v.to_le_bytes())?;
+            Ok(17)
         }
         NativeKey::IpPort(Ip::V4(v), port) => {
             out.write_all(&[3])?;
             out.write_all(&v.to_le_bytes())?;
-            out.write_all(&port.to_le_bytes())
+            out.write_all(&port.to_le_bytes())?;
+            Ok(7)
         }
         NativeKey::IpPort(Ip::V6(v), port) => {
             out.write_all(&[4])?;
             out.write_all(&v.to_le_bytes())?;
-            out.write_all(&port.to_le_bytes())
+            out.write_all(&port.to_le_bytes())?;
+            Ok(19)
         }
     }
 }
@@ -132,7 +158,7 @@ impl Buckets {
             std::fs::remove_file(&path)?;
             writers.push(BufWriter::with_capacity(1 << 16, f));
         }
-        Ok(Buckets { writers, shift, mask: table_mask })
+        Ok(Buckets { writers, shift, mask: table_mask, since_sync: 0 })
     }
 
     #[inline]
@@ -145,9 +171,18 @@ impl Buckets {
         let w = &mut self.writers[b];
         w.write_all(&hash.to_le_bytes())?;
         w.write_all(&pair.to_le_bytes())?;
-        encode_native(w, native)?;
+        let native_bytes = encode_native(w, native)?;
         w.write_all(&(trail.len() as u32).to_le_bytes())?;
         w.write_all(trail.as_bytes())?;
+
+        // See `PACE_SYNC_BYTES`'s doc: this is the backpressure that keeps the partition phase
+        // from dirtying pages far faster than a slow or throttled device can write them back.
+        self.since_sync += 8 + 4 + native_bytes + 4 + trail.len();
+        if self.since_sync >= PACE_SYNC_BYTES {
+            w.flush()?;
+            w.get_ref().sync_data()?;
+            self.since_sync = 0;
+        }
         Ok(())
     }
 

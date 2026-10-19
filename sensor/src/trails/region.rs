@@ -213,9 +213,30 @@ impl<T: Pod> Region<T> {
                 .iter()
                 .all(|b| *b == 0);
             if !zero {
+                // Paced the same way `loader.rs`'s `Buckets::write` paces its own writes, and for
+                // the same reason: an unpaced loop dirties this whole region - tens to well over
+                // a hundred MB for the big tables - as fast as the CPU can go, far faster than a
+                // slow or throttled device can write it back. A cgroup `memory.max` can OOM-kill
+                // that backlog outright even though the memory is nominally reclaimable, because
+                // reclaimability only helps if reclaim can keep pace with allocation. `msync`'s
+                // default (synchronous) mode blocks until the range is actually written, which
+                // is exactly the backpressure this needs.
+                const PACE_BYTES: usize = 1 << 20;
+                let elem_size = std::mem::size_of::<T>().max(1);
+                let pace_elems = (PACE_BYTES / elem_size).max(1);
+                let mut filled_from = 0usize;
                 for i in 0..len {
                     // SAFETY: `ptr` maps `len` elements, page-aligned (so aligned for any `T` here).
                     unsafe { ptr.add(i).write(value) };
+                    if i + 1 - filled_from >= pace_elems || i + 1 == len {
+                        #[cfg(target_os = "linux")]
+                        unsafe {
+                            let start = ptr.add(filled_from) as *mut libc::c_void;
+                            let span = (i + 1 - filled_from) * elem_size;
+                            libc::msync(start, span, libc::MS_SYNC);
+                        }
+                        filled_from = i + 1;
+                    }
                 }
             }
             return Region { ptr, len, backing: Backing::Mapped { bytes }, _marker: PhantomData };
