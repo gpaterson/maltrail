@@ -7,13 +7,190 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{BufReader, Read};
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use crate::addr::Ip;
 use super::regexset::TrailRegexBuilder;
 use super::region::Spill;
 use super::{NativeKey, TrailDb, TrailDbBuilder};
 use crate::whitelist::Whitelist;
+
+/// Defers the table-insert pass, bucketed so each bucket's replay only ever writes near where
+/// it is already warm, instead of scattering across the whole (file-backed) table from the
+/// first row.
+///
+/// Why this exists: `StrTable::insert_hashed` places a key at `hash & mask`, which for 1.9 M
+/// rows in CSV order means the FIRST row can land anywhere in the final ~100+ MB slot array, and
+/// so can every row after it - the table's "hot" working set is the whole table, immediately,
+/// for the entire build. File-backed, every one of those scattered touches that does not fit in
+/// what the box can actually keep resident is a page fault against real (and, on the hardware
+/// this is for, slow) storage. Partitioning by the SAME bits `hash & mask` already uses for the
+/// first probe turns that into K bounded passes, each covering one contiguous ~(table size / K)
+/// slice: bucket i's rows are written out sequentially during the parse (cheap - any order was
+/// already fine for a stream of appends to K files), then replayed into the real table bucket by
+/// bucket, so at any moment only one slice of the table is being touched at all.
+///
+/// What this must NOT disturb, because both are relied on elsewhere: pair interning order (first
+/// appearance in the file) and the wildcard regex's group numbering (CSV order, 100-group cap).
+/// Neither goes through `Buckets` at all - both still happen exactly where they always did, in
+/// the original per-shard drain, before a row's resolved `(hash, pair, native)` is handed to
+/// `Buckets::write`. Only the actual `insert_prepared` call - order-insensitive for distinct
+/// keys, and safe for duplicates because every occurrence of the SAME key hashes to the SAME
+/// bucket, so within-bucket order is still exactly file order for that key - is deferred.
+struct Buckets {
+    writers: Vec<BufWriter<File>>,
+    shift: u32,
+    mask: usize,
+}
+
+/// Target bucket size. Small enough to comfortably fit in RAM that is actually free on the
+/// hardware this is for (see `cache.rs`'s module doc for the numbers that motivated this), large
+/// enough that the per-bucket fixed overhead (opening two files, one read pass) stays a rounding
+/// error next to a 1.9 M-row build.
+const BUCKET_TARGET_BYTES: usize = 10 << 20;
+
+/// Per-entry encoding: `hash:u64, pair:u32, native tag:u8 [+ payload], trail len:u32, trail
+/// bytes`. Fixed-then-variable, in that order, so a reader never has to buffer more than one
+/// entry to replay it.
+fn encode_native(out: &mut impl Write, native: NativeKey) -> std::io::Result<()> {
+    match native {
+        NativeKey::None => out.write_all(&[0]),
+        NativeKey::Ip(Ip::V4(v)) => {
+            out.write_all(&[1])?;
+            out.write_all(&v.to_le_bytes())
+        }
+        NativeKey::Ip(Ip::V6(v)) => {
+            out.write_all(&[2])?;
+            out.write_all(&v.to_le_bytes())
+        }
+        NativeKey::IpPort(Ip::V4(v), port) => {
+            out.write_all(&[3])?;
+            out.write_all(&v.to_le_bytes())?;
+            out.write_all(&port.to_le_bytes())
+        }
+        NativeKey::IpPort(Ip::V6(v), port) => {
+            out.write_all(&[4])?;
+            out.write_all(&v.to_le_bytes())?;
+            out.write_all(&port.to_le_bytes())
+        }
+    }
+}
+
+fn decode_native(r: &mut impl Read) -> std::io::Result<NativeKey> {
+    let mut tag = [0u8; 1];
+    r.read_exact(&mut tag)?;
+    Ok(match tag[0] {
+        0 => NativeKey::None,
+        1 => {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            NativeKey::Ip(Ip::V4(u32::from_le_bytes(b)))
+        }
+        2 => {
+            let mut b = [0u8; 16];
+            r.read_exact(&mut b)?;
+            NativeKey::Ip(Ip::V6(u128::from_le_bytes(b)))
+        }
+        3 => {
+            let mut b = [0u8; 4];
+            r.read_exact(&mut b)?;
+            let v = u32::from_le_bytes(b);
+            let mut p = [0u8; 2];
+            r.read_exact(&mut p)?;
+            NativeKey::IpPort(Ip::V4(v), u16::from_le_bytes(p))
+        }
+        _ => {
+            let mut b = [0u8; 16];
+            r.read_exact(&mut b)?;
+            let v = u128::from_le_bytes(b);
+            let mut p = [0u8; 2];
+            r.read_exact(&mut p)?;
+            NativeKey::IpPort(Ip::V6(v), u16::from_le_bytes(p))
+        }
+    })
+}
+
+impl Buckets {
+    /// `table_mask` is the (pre-growth) `StrTable` mask being built towards; `count` is clamped
+    /// to a power of two so bucket boundaries are a clean bit-shift of it, and to at least 1 so a
+    /// tiny table (nothing to partition) degenerates to one bucket rather than a special case.
+    fn new(dir: &Path, table_mask: usize, estimated_table_bytes: usize) -> std::io::Result<Buckets> {
+        let count = (estimated_table_bytes / BUCKET_TARGET_BYTES).max(1).next_power_of_two();
+        let capacity = table_mask + 1;
+        let shift = capacity.trailing_zeros().saturating_sub(count.trailing_zeros());
+        let mut writers = Vec::with_capacity(count);
+        for i in 0..count {
+            let path = dir.join(format!(".maltrail-bucket-{}-{}", std::process::id(), i));
+            // `File::create` alone opens write-only - `replay` reads back through this SAME fd
+            // after writing, so it needs both.
+            let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+            // Unlinked at once, same reasoning as `region.rs`'s `Spill`: the open handle keeps
+            // the inode alive for exactly as long as this load needs it, and nothing is left
+            // behind by any way this process can end.
+            std::fs::remove_file(&path)?;
+            writers.push(BufWriter::with_capacity(1 << 16, f));
+        }
+        Ok(Buckets { writers, shift, mask: table_mask })
+    }
+
+    #[inline]
+    fn bucket_of(&self, hash: u64) -> usize {
+        (hash as usize & self.mask) >> self.shift
+    }
+
+    fn write(&mut self, trail: &str, hash: u64, pair: u32, native: NativeKey) -> std::io::Result<()> {
+        let b = self.bucket_of(hash);
+        let w = &mut self.writers[b];
+        w.write_all(&hash.to_le_bytes())?;
+        w.write_all(&pair.to_le_bytes())?;
+        encode_native(w, native)?;
+        w.write_all(&(trail.len() as u32).to_le_bytes())?;
+        w.write_all(trail.as_bytes())?;
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.writers.len()
+    }
+
+    /// Replay bucket `i`'s rows into `builder`, in the order `Buckets::write` received them -
+    /// exactly file order for any two rows that share a key, which is what duplicate resolution
+    /// needs; unordered relative to any OTHER bucket, which costs nothing because insertion order
+    /// across distinct keys was never significant.
+    fn replay(&mut self, i: usize, builder: &mut TrailDbBuilder) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let w = &mut self.writers[i];
+        w.flush()?;
+        let file = w.get_mut();
+        file.seek(SeekFrom::Start(0))?;
+        let mut r = BufReader::with_capacity(1 << 16, file);
+        let mut trail_buf = String::new();
+        loop {
+            let mut hash_bytes = [0u8; 8];
+            match r.read_exact(&mut hash_bytes) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+            let hash = u64::from_le_bytes(hash_bytes);
+            let mut pair_bytes = [0u8; 4];
+            r.read_exact(&mut pair_bytes)?;
+            let pair = u32::from_le_bytes(pair_bytes);
+            let native = decode_native(&mut r)?;
+            let mut len_bytes = [0u8; 4];
+            r.read_exact(&mut len_bytes)?;
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            let mut raw = vec![0u8; len];
+            r.read_exact(&mut raw)?;
+            trail_buf.clear();
+            trail_buf.push_str(&String::from_utf8_lossy(&raw));
+            builder.insert_prepared(&trail_buf, hash, pair, native);
+        }
+        Ok(())
+    }
+}
 
 /// Split one CSV record the way Python's `csv.reader(delimiter=',', quotechar='"')` does
 /// (doublequote, non-strict, no escapechar). Returns the field count actually produced.
@@ -335,6 +512,13 @@ pub fn load_trails(path: &Path, whitelist: &Whitelist, options: LoadOptions) -> 
     // is cheap.
     let arena_hint = if spill.is_some() { file_len } else { file_len / 3 };
     let mut builder = TrailDbBuilder::new_in(estimated_rows, arena_hint, spill.as_ref());
+    // Only when file-backed: on the heap, random-order inserts are not the slow thing bucketing
+    // exists to avoid (see `Buckets`'s doc) - RAM has no concept of "sequential vs scattered"
+    // cost, so this would only add overhead there for nothing.
+    let mut buckets = match &spill {
+        Some(s) => Some(Buckets::new(s.dir(), builder.strings_mask(), builder.strings_capacity_bytes())?),
+        None => None,
+    };
     let mut regex_builder = TrailRegexBuilder::with_repair(options.repair_truncated_trails);
     let mut pair_index: HashMap<(String, String), u32> = HashMap::with_capacity(8192);
     let mut stats = LoadStats { rows: 0, loaded: 0, whitelisted: 0, malformed: 0 };
@@ -412,11 +596,22 @@ pub fn load_trails(path: &Path, whitelist: &Whitelist, options: LoadOptions) -> 
                 for (trail, reference) in &shard.wildcards {
                     regex_builder.offer(trail, reference);
                 }
-                for (i, row) in shard.rows.iter().enumerate() {
-                    if let Some(ahead) = shard.rows.get(i + PREFETCH_DISTANCE) {
-                        builder.prefetch(ahead.hash);
+                match &mut buckets {
+                    // Deferred: this row's eventual `insert_prepared` happens later, in bucket
+                    // order, during the replay pass below - see `Buckets`'s doc for why.
+                    Some(b) => {
+                        for row in shard.rows.iter() {
+                            b.write(&row.trail, row.hash, local_to_global[row.pair as usize], row.native)?;
+                        }
                     }
-                    builder.insert_prepared(&row.trail, row.hash, local_to_global[row.pair as usize], row.native);
+                    None => {
+                        for (i, row) in shard.rows.iter().enumerate() {
+                            if let Some(ahead) = shard.rows.get(i + PREFETCH_DISTANCE) {
+                                builder.prefetch(ahead.hash);
+                            }
+                            builder.insert_prepared(&row.trail, row.hash, local_to_global[row.pair as usize], row.native);
+                        }
+                    }
                 }
                 stats.rows += shard.stats.rows;
                 stats.loaded += shard.stats.loaded;
@@ -429,6 +624,15 @@ pub fn load_trails(path: &Path, whitelist: &Whitelist, options: LoadOptions) -> 
         filled -= end;
         if eof && filled == 0 {
             break;
+        }
+    }
+
+    // Every row has been parsed, pair-interned and offered to the regex builder by now - what is
+    // left is only the table-insert pass, deferred bucket by bucket so each one only ever touches
+    // the slice of the table it is about to write into (see `Buckets`'s doc).
+    if let Some(mut b) = buckets {
+        for i in 0..b.len() {
+            b.replay(i, &mut builder)?;
         }
     }
 

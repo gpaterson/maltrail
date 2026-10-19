@@ -61,6 +61,12 @@ impl Spill {
         Spill { dir: Arc::new(dir) }
     }
 
+    /// Where this spill's regions live - for `loader.rs`'s `Buckets`, which keeps its own
+    /// temporary files in the same place.
+    pub(crate) fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
     #[cfg(target_os = "linux")]
     fn map(&self, bytes: usize) -> Option<*mut u8> {
         use std::os::unix::ffi::OsStrExt;
@@ -70,7 +76,11 @@ impl Spill {
         if bytes == 0 {
             return None;
         }
-        let name = format!(".maltrail-trails-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed));
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        if std::env::var_os("MALTRAIL_TRACE_SPILL").is_some() {
+            eprintln!("[SPILLTRACE] seq={seq} bytes={bytes}");
+        }
+        let name = format!(".maltrail-trails-{}-{}", std::process::id(), seq);
         let path = self.dir.join(name);
         let mut cpath = path.as_os_str().as_bytes().to_vec();
         cpath.push(0);

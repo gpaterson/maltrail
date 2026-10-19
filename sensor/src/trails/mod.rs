@@ -291,6 +291,20 @@ impl TrailDbBuilder {
         idx
     }
 
+    /// The `strings` table's current slot mask - for `loader.rs`'s `Buckets`, which partitions
+    /// by the same bits `StrTable::insert_hashed` uses for a key's first probe, so each bucket
+    /// covers one contiguous slice of the table it is about to be inserted into.
+    pub(crate) fn strings_mask(&self) -> usize {
+        self.strings.mask()
+    }
+
+    /// Roughly how many bytes the `strings` slot array will occupy at its current capacity - for
+    /// `loader.rs`'s `Buckets` to size itself against (how many ~10 MB buckets a table this big
+    /// needs), not an exact accounting.
+    pub(crate) fn strings_capacity_bytes(&self) -> usize {
+        (self.strings.mask() + 1) * StrTable::slot_byte_size()
+    }
+
     /// Insert a trail key. Native side tables get a mirror only when the key is the exact
     /// text Maltrail would render for that address, which keeps the native lookups
     /// equivalent to Python's string comparison.
